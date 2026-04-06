@@ -201,7 +201,9 @@ async def run_telegram_listener(trade_manager, settings):
             phone = await loop.run_in_executor(None, _prompt_phone)
         if not phone:
             raise ValueError("Phone required for Telegram login")
-        await client.send_code_request(phone.replace(" ", "").strip())
+        phone = phone.replace(" ", "").strip()
+        await client.send_code_request(phone)
+        logger.info("Telegram code sent to %s — set TELEGRAM_CODE env var", phone)
         code = (getattr(settings, "telegram_code", None) or "").strip()
         if not code:
             code = await loop.run_in_executor(None, _prompt_code)
@@ -212,6 +214,10 @@ async def run_telegram_listener(trade_manager, settings):
         except SessionPasswordNeededError:
             password = await loop.run_in_executor(None, _prompt_password)
             await client.sign_in(password=password)
+        # Export session string for future deploys
+        if isinstance(client.session, StringSession):
+            new_ss = StringSession.save(client.session)
+            logger.info("AUTH SUCCESS — save this as TELEGRAM_SESSION_STRING: %s", new_ss)
 
     async def connect_and_listen():
         handlers_added = False
