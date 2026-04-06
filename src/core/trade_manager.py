@@ -191,15 +191,17 @@ class TradeManager:
 
             trade_index = await self.client.get_next_trade_index(pair_index)
 
-            # Open with TP=0 (disabled) — bot manages exits via partial closes
+            # Set on-chain TP to last target as safety net
+            # Bot manages partial closes at each target before that
             # SL is on-chain for safety
+            last_target = targets[-1] if targets else 0
             tx_hash = await self.client.open_trade(
                 pair_index=pair_index,
                 position_size_usd=trade.position_size_usd,
                 open_price=current_price,
                 is_long=is_long,
                 leverage=trade.leverage,
-                tp_price=0,  # No on-chain TP — bot manages targets
+                tp_price=last_target,  # Last target as on-chain safety TP
                 sl_price=trade.stop_loss,
                 trade_index=trade_index,
             )
