@@ -40,7 +40,8 @@ class ActiveTrade:
         self.stop_loss = trade.stop_loss
         self.current_target_idx = 0
         self.is_long = trade.direction == TradeDirection.LONG
-        self.remaining_collateral = trade.position_size_usd  # track what's left
+        self.remaining_collateral = trade.position_size_usd
+        self.opened_at = datetime.now(timezone.utc)  # grace period for API indexing
 
 
 class TradeManager:
@@ -367,8 +368,13 @@ class TradeManager:
                 open_on_chain.add((pi, idx))
 
         closed_ids = []
+        now = datetime.now(timezone.utc)
         for trade_id, at in list(self._active_trades.items()):
             if at.pair_index is None or at.onchain_index is None:
+                continue
+            # Grace period: don't reconcile trades opened < 90s ago (API indexing delay)
+            age = (now - at.opened_at).total_seconds()
+            if age < 90:
                 continue
             if (at.pair_index, at.onchain_index) not in open_on_chain:
                 logger.info("Trade %s closed on-chain (SL hit or liquidated)", trade_id[:8])
