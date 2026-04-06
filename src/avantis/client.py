@@ -342,9 +342,10 @@ class AvantisClient:
             resp = await self._http.get(url)
             resp.raise_for_status()
             data = resp.json()
-            trades = data.get("trades", data.get("openTrades", []))
-            if isinstance(trades, list):
-                return trades
+            # API returns "positions" key
+            positions = data.get("positions", data.get("trades", data.get("openTrades", [])))
+            if isinstance(positions, list):
+                return positions
             return []
         except Exception as e:
             logger.error("Failed to fetch open positions: %s", e)
