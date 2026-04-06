@@ -1,6 +1,6 @@
 """
 Avantis DEX on-chain client.
-Handles openTrade, closeTradeMarket, position queries via web3.py on Base.
+Handles openTrade, closeTradeMarket, updateSl, updateTp, position queries via web3.py on Base.
 """
 
 import logging
@@ -54,6 +54,33 @@ TRADING_ABI = [
             {"name": "_pairIndex", "type": "uint256"},
             {"name": "_index", "type": "uint256"},
             {"name": "_amount", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+    # updateSl(uint256 pairIndex, uint256 index, uint256 newSl, bytes[] priceUpdateData, uint8 orderType)
+    {
+        "name": "updateSl",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "_pairIndex", "type": "uint256"},
+            {"name": "_index", "type": "uint256"},
+            {"name": "_newSl", "type": "uint256"},
+            {"name": "_priceUpdateData", "type": "bytes[]"},
+            {"name": "_orderType", "type": "uint8"},
+        ],
+        "outputs": [],
+    },
+    # updateTp(address trader, uint256 pairIndex, uint256 index, uint256 newTp)
+    {
+        "name": "updateTp",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "_trader", "type": "address"},
+            {"name": "_pairIndex", "type": "uint256"},
+            {"name": "_index", "type": "uint256"},
+            {"name": "_newTp", "type": "uint256"},
         ],
         "outputs": [],
     },
@@ -168,29 +195,24 @@ class AvantisClient:
     # ── USDC ─────────────────────────────────────────────────
 
     async def get_usdc_balance(self) -> float:
-        """Get USDC balance in USD."""
         raw = self.usdc.functions.balanceOf(self.wallet).call()
         return raw / 10**6
 
     async def get_eth_balance(self) -> float:
-        """Get ETH balance."""
         raw = self.w3.eth.get_balance(self.wallet)
         return self.w3.from_wei(raw, "ether")
 
     async def ensure_usdc_approval(self, amount_usd: float) -> None:
-        """Approve USDC to TradingStorage if allowance is insufficient."""
         raw_amount = self._to_usdc(amount_usd)
         allowance = self.usdc.functions.allowance(self.wallet, self.storage_address).call()
         if allowance >= raw_amount:
             return
-        logger.info("Approving USDC: %s to TradingStorage", amount_usd)
+        logger.info("Approving USDC to TradingStorage")
         tx = self.usdc.functions.approve(
-            self.storage_address,
-            2**256 - 1  # Max approval
+            self.storage_address, 2**256 - 1
         ).build_transaction({"from": self.wallet})
         tx_hash = await self._send_tx(tx)
         await self._wait_for_receipt(tx_hash)
-        logger.info("USDC approved")
 
     # ── Open Trade ───────────────────────────────────────────
 
@@ -205,22 +227,19 @@ class AvantisClient:
         sl_price: float,
         trade_index: int = 0,
     ) -> str:
-        """
-        Open a trade on Avantis.
-        Returns tx hash.
-        """
+        """Open a trade on Avantis. TP=0 disables on-chain TP. Returns tx hash."""
         await self.ensure_usdc_approval(position_size_usd)
 
         trade_tuple = (
             self.wallet,                          # trader
             pair_index,                           # pairIndex
-            trade_index,                          # index (next available slot)
+            trade_index,                          # index
             0,                                    # initialPosToken (0 for market)
             self._to_usdc(position_size_usd),     # positionSizeUSDC
             self._to_price(open_price),           # openPrice
             is_long,                              # buy
             self._to_leverage(leverage),          # leverage
-            self._to_price(tp_price),             # tp
+            self._to_price(tp_price) if tp_price else 0,  # tp (0 = no TP)
             self._to_price(sl_price),             # sl
             0,                                    # timestamp (contract fills)
         )
@@ -229,63 +248,100 @@ class AvantisClient:
         exec_fee = self.w3.to_wei(self.settings.execution_fee_eth, "ether")
 
         tx = self.trading.functions.openTrade(
-            trade_tuple,
-            0,          # _type = MARKET
-            slippage,
-        ).build_transaction({
-            "from": self.wallet,
-            "value": exec_fee,
-        })
+            trade_tuple, 0, slippage,
+        ).build_transaction({"from": self.wallet, "value": exec_fee})
 
         logger.info(
             "Opening trade: pair=%d %s %dx, size=$%.2f, price=%.2f, tp=%.2f, sl=%.2f",
             pair_index, "LONG" if is_long else "SHORT", leverage,
-            position_size_usd, open_price, tp_price, sl_price,
+            position_size_usd, open_price, tp_price or 0, sl_price,
         )
 
         tx_hash = await self._send_tx(tx)
-        receipt = await self._wait_for_receipt(tx_hash)
+        await self._wait_for_receipt(tx_hash)
         return tx_hash
 
-    # ── Close Trade ──────────────────────────────────────────
+    # ── Close Trade (full or partial) ────────────────────────
 
     async def close_trade(
         self,
         pair_index: int,
         trade_index: int,
-        amount: int = 0,  # 0 = close full position
+        amount_usdc: float = 0,  # 0 = close full position
     ) -> str:
-        """Close a trade on Avantis. Returns tx hash."""
+        """Close a trade (full or partial). amount_usdc=0 closes all."""
         exec_fee = self.w3.to_wei(self.settings.execution_fee_eth, "ether")
+        raw_amount = self._to_usdc(amount_usdc) if amount_usdc > 0 else 0
 
         tx = self.trading.functions.closeTradeMarket(
-            pair_index,
-            trade_index,
-            amount,
-        ).build_transaction({
-            "from": self.wallet,
-            "value": exec_fee,
-        })
+            pair_index, trade_index, raw_amount,
+        ).build_transaction({"from": self.wallet, "value": exec_fee})
 
-        logger.info("Closing trade: pair=%d, index=%d", pair_index, trade_index)
+        if amount_usdc > 0:
+            logger.info("Partial close: pair=%d, index=%d, amount=$%.2f", pair_index, trade_index, amount_usdc)
+        else:
+            logger.info("Full close: pair=%d, index=%d", pair_index, trade_index)
 
         tx_hash = await self._send_tx(tx)
-        receipt = await self._wait_for_receipt(tx_hash)
+        await self._wait_for_receipt(tx_hash)
+        return tx_hash
+
+    # ── Update SL ────────────────────────────────────────────
+
+    async def update_sl(
+        self,
+        pair_index: int,
+        trade_index: int,
+        new_sl_price: float,
+    ) -> str:
+        """Move stop loss to a new price. Returns tx hash."""
+        exec_fee = self.w3.to_wei(self.settings.execution_fee_eth, "ether")
+
+        tx = self.trading.functions.updateSl(
+            pair_index,
+            trade_index,
+            self._to_price(new_sl_price),
+            [],     # priceUpdateData (empty — uses on-chain oracle)
+            0,      # orderType (0 = market SL)
+        ).build_transaction({"from": self.wallet, "value": exec_fee})
+
+        logger.info("Update SL: pair=%d, index=%d, new_sl=%.2f", pair_index, trade_index, new_sl_price)
+
+        tx_hash = await self._send_tx(tx)
+        await self._wait_for_receipt(tx_hash)
+        return tx_hash
+
+    # ── Update TP ────────────────────────────────────────────
+
+    async def update_tp(
+        self,
+        pair_index: int,
+        trade_index: int,
+        new_tp_price: float,
+    ) -> str:
+        """Move take profit to a new price. Returns tx hash."""
+        tx = self.trading.functions.updateTp(
+            self.wallet,
+            pair_index,
+            trade_index,
+            self._to_price(new_tp_price) if new_tp_price else 0,
+        ).build_transaction({"from": self.wallet})
+
+        logger.info("Update TP: pair=%d, index=%d, new_tp=%.2f", pair_index, trade_index, new_tp_price or 0)
+
+        tx_hash = await self._send_tx(tx)
+        await self._wait_for_receipt(tx_hash)
         return tx_hash
 
     # ── Position Queries ─────────────────────────────────────
 
     async def get_open_positions(self) -> list[dict[str, Any]]:
-        """
-        Fetch open positions from Avantis API.
-        Returns list of position dicts.
-        """
+        """Fetch open positions from Avantis API."""
         url = f"https://core.avantisfi.com/user-data?trader={self.wallet}"
         try:
             resp = await self._http.get(url)
             resp.raise_for_status()
             data = resp.json()
-            # The API returns trades under various keys; normalize
             trades = data.get("trades", data.get("openTrades", []))
             if isinstance(trades, list):
                 return trades
@@ -295,10 +351,7 @@ class AvantisClient:
             return []
 
     async def get_next_trade_index(self, pair_index: int) -> int:
-        """
-        Get next available trade index for a pair.
-        Checks open positions and returns max index + 1, or 0 if none.
-        """
+        """Get next available trade index for a pair."""
         positions = await self.get_open_positions()
         max_index = -1
         for pos in positions:

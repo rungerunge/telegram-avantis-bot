@@ -44,6 +44,7 @@ class Trade(Base):
     position_size_usd: Mapped[float] = mapped_column(Float, nullable=False)
 
     targets: Mapped[str] = mapped_column(JSON, nullable=False)
+    current_target_idx: Mapped[int] = mapped_column(Integer, default=0)
     stop_loss: Mapped[float] = mapped_column(Float, nullable=False)
 
     # Avantis-specific
