@@ -335,8 +335,8 @@ class AvantisClient:
 
     # ── Position Queries ─────────────────────────────────────
 
-    async def get_open_positions(self) -> list[dict[str, Any]]:
-        """Fetch open positions from Avantis API."""
+    async def get_open_positions(self) -> list[dict[str, Any]] | None:
+        """Fetch open positions from Avantis API. Returns None on error (vs empty list for no positions)."""
         url = f"https://core.avantisfi.com/user-data?trader={self.wallet}"
         try:
             resp = await self._http.get(url)
@@ -349,11 +349,11 @@ class AvantisClient:
             return []
         except Exception as e:
             logger.error("Failed to fetch open positions: %s", e)
-            return []
+            return None  # None = error, don't reconcile
 
     async def get_next_trade_index(self, pair_index: int) -> int:
         """Get next available trade index for a pair."""
-        positions = await self.get_open_positions()
+        positions = await self.get_open_positions() or []
         max_index = -1
         for pos in positions:
             pi = int(pos.get("pairIndex", -1))

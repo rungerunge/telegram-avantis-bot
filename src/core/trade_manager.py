@@ -355,6 +355,10 @@ class TradeManager:
 
         positions = await self.client.get_open_positions()
 
+        # None = API error — skip reconciliation to avoid false closures
+        if positions is None:
+            return
+
         open_on_chain = set()
         for pos in positions:
             pi = int(pos.get("pairIndex", -1))
