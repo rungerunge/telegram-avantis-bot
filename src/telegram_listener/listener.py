@@ -7,6 +7,7 @@ Only the trade_manager.create_trade call changed (now targets Avantis DEX).
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -46,6 +47,7 @@ async def run_telegram_listener(trade_manager, settings):
         from telethon import TelegramClient
         from telethon.errors import SessionPasswordNeededError
         from telethon.events import NewMessage, MessageEdited
+        from telethon.sessions import StringSession
     except ImportError:
         logger.error("telethon not installed. pip install telethon")
         return None, None
@@ -58,8 +60,16 @@ async def run_telegram_listener(trade_manager, settings):
         logger.warning("Telegram listener: missing API_ID, API_HASH, or CHANNEL. Skipping.")
         return None, None
 
+    # Use StringSession from env var if available (for Railway/containers)
+    session_string = os.environ.get("TELEGRAM_SESSION_STRING", "").strip()
+    if session_string:
+        session = StringSession(session_string)
+        logger.info("Using TELEGRAM_SESSION_STRING for Telegram auth")
+    else:
+        session = SESSION_PATH
+
     client = TelegramClient(
-        SESSION_PATH, int(api_id), api_hash,
+        session, int(api_id), api_hash,
         connection_retries=5, retry_delay=1, auto_reconnect=True,
     )
     debug_blocks = getattr(settings, "telegram_signal_debug", False)
