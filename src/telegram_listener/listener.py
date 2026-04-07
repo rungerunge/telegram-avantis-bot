@@ -195,6 +195,11 @@ async def run_telegram_listener(trade_manager, settings):
         await client.connect()
         if await client.is_user_authorized():
             return
+        # If we're using a StringSession, don't try phone login — just raise
+        # so the retry loop can wait and try the session again
+        if session_string:
+            raise RuntimeError("StringSession not authorized — session may have been invalidated by deploy overlap")
+        # Fall back to phone login only when no StringSession is configured
         loop = asyncio.get_event_loop()
         phone = (getattr(settings, "telegram_phone", None) or "").strip()
         if not phone:
@@ -214,7 +219,6 @@ async def run_telegram_listener(trade_manager, settings):
         except SessionPasswordNeededError:
             password = await loop.run_in_executor(None, _prompt_password)
             await client.sign_in(password=password)
-        # Export session string for future deploys
         if isinstance(client.session, StringSession):
             new_ss = StringSession.save(client.session)
             logger.info("AUTH SUCCESS — save this as TELEGRAM_SESSION_STRING: %s", new_ss)
