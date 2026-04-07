@@ -223,6 +223,16 @@ async def run_telegram_listener(trade_manager, settings):
         handlers_added = False
         entity = None
         consecutive_failures = 0
+        auth_dup_retries = 0
+
+        # Delay startup by 30s to let Railway kill the old container first.
+        # During deploys, old and new containers overlap — both using the same
+        # Telegram session causes AUTH_KEY_DUPLICATED. The HTTP server starts
+        # immediately (for health checks), but we delay Telegram to avoid overlap.
+        startup_delay = int(os.environ.get("TELEGRAM_STARTUP_DELAY", "30"))
+        if startup_delay > 0:
+            logger.info("Telegram: waiting %ds for old container to shut down...", startup_delay)
+            await asyncio.sleep(startup_delay)
 
         while True:
             try:
@@ -250,11 +260,34 @@ async def run_telegram_listener(trade_manager, settings):
                     logger.info("Telegram: watching %s", name)
 
                 consecutive_failures = 0
+                auth_dup_retries = 0
                 await client.run_until_disconnected()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                err_msg = str(e)
+
+                # AUTH_KEY_DUPLICATED: old container was still alive during deploy.
+                # Wait longer and retry — don't count toward fatal failure limit.
+                if "AUTH_KEY_DUPLICATED" in err_msg or "used under two different" in err_msg:
+                    auth_dup_retries += 1
+                    wait = min(30 * auth_dup_retries, 120)  # 30s, 60s, 90s, max 120s
+                    logger.warning(
+                        "Telegram: session conflict (old container still alive?). "
+                        "Retry %d, waiting %ds...", auth_dup_retries, wait
+                    )
+                    # Recreate client with fresh session string to recover
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    session_string = os.environ.get("TELEGRAM_SESSION_STRING", "").strip()
+                    if session_string:
+                        client._session = StringSession(session_string)
+                    await asyncio.sleep(wait)
+                    continue
+
                 consecutive_failures += 1
                 if consecutive_failures >= 10:
                     logger.critical("Telegram: %d failures, stopping", consecutive_failures)
