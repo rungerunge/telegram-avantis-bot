@@ -209,6 +209,7 @@ def _html() -> str:
 
   <script>
     function $(id) { return document.getElementById(id); }
+    function esc(s) { if(s==null) return ''; let d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 
     function statCard(label, value, opts={}) {
       const cls = opts.positive ? 'text-emerald-400' : opts.negative ? 'text-red-400' : opts.accent ? 'text-blue-400' : 'text-white';
