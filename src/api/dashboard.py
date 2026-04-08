@@ -85,8 +85,33 @@ async def dashboard_data():
     except Exception:
         pass
 
+    # Telegram status
+    try:
+        from ..telegram_listener import telegram_status
+        stats["telegram"] = dict(telegram_status)
+    except Exception:
+        stats["telegram"] = {"connected": False, "error": "import failed"}
+
+    # Recent Telegram messages
+    tg_messages = []
+    try:
+        async with get_db_session() as session:
+            repo = TradeRepository(session)
+            msgs = await repo.get_telegram_messages(limit=50)
+            for m in msgs:
+                tg_messages.append({
+                    "message_id": m.message_id,
+                    "text": m.text[:500] if m.text else "",
+                    "is_edit": m.is_edit,
+                    "is_signal": m.is_signal,
+                    "block_reason": m.block_reason,
+                    "received_at": m.received_at.isoformat() if m.received_at else None,
+                })
+    except Exception:
+        pass
+
     stats["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return {"trades": trades_list, "stats": stats}
+    return {"trades": trades_list, "stats": stats, "messages": tg_messages}
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
@@ -117,6 +142,12 @@ def _html() -> str:
     .mono { font-family:'JetBrains Mono',monospace; }
     .card { background:#18181b; border:1px solid #27272a; border-radius:12px; }
     .card-glow { box-shadow: 0 0 30px -8px rgba(59,130,246,0.15); border-color: rgba(59,130,246,0.3); }
+    .tg-connected { color:#4ade80; }
+    .tg-disconnected { color:#f87171; }
+    .pulse-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+    .pulse-green { background:#4ade80; box-shadow:0 0 6px #4ade80; animation:pulse 2s infinite; }
+    .pulse-red { background:#f87171; box-shadow:0 0 6px #f87171; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
     .badge { display:inline-flex; align-items:center; padding:2px 8px; border-radius:9999px; font-size:11px; font-weight:600; letter-spacing:0.5px; }
     .badge-long { background:rgba(34,197,94,0.15); color:#4ade80; }
     .badge-short { background:rgba(239,68,68,0.15); color:#f87171; }
@@ -135,8 +166,8 @@ def _html() -> str:
 <body class="min-h-screen antialiased">
   <div class="max-w-7xl mx-auto px-4 sm:px-6 py-6">
 
-    <!-- Header -->
-    <div class="flex items-center justify-between mb-6">
+    <!-- Header + Telegram Status -->
+    <div class="flex items-center justify-between mb-4">
       <div>
         <h1 class="text-xl font-bold text-white tracking-tight">Avantis Auto-Trader</h1>
         <p class="text-zinc-500 text-xs mt-0.5">Telegram signals → Base chain perps</p>
@@ -147,11 +178,14 @@ def _html() -> str:
       </div>
     </div>
 
+    <!-- Telegram Status Bar -->
+    <div id="tg-status" class="card px-4 py-2.5 mb-4 flex items-center gap-3 text-xs"></div>
+
     <!-- Stats -->
     <div id="stats" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6"></div>
 
     <!-- Trades -->
-    <div class="card overflow-hidden">
+    <div class="card overflow-hidden mb-6">
       <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between">
         <h3 class="text-sm font-semibold text-zinc-400">Positions</h3>
         <span id="trade-count" class="text-xs text-zinc-600 mono"></span>
@@ -160,6 +194,15 @@ def _html() -> str:
         <div id="loading" class="py-12 text-center text-zinc-500 text-sm">Loading...</div>
         <div id="trades-container" style="display:none"></div>
       </div>
+    </div>
+
+    <!-- Telegram Message Feed -->
+    <div class="card overflow-hidden">
+      <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between">
+        <h3 class="text-sm font-semibold text-zinc-400">Telegram Feed</h3>
+        <span id="msg-count" class="text-xs text-zinc-600 mono"></span>
+      </div>
+      <div id="messages-container" class="max-h-96 overflow-y-auto"></div>
     </div>
 
   </div>
@@ -235,7 +278,18 @@ def _html() -> str:
     async function load() {
       try {
         const r = await fetch('/dashboard/data');
-        const {trades, stats} = await r.json();
+        const {trades, stats, messages} = await r.json();
+
+        // Telegram status bar
+        const tg = stats.telegram || {};
+        const connected = tg.connected;
+        const dotCls = connected ? 'pulse-green' : 'pulse-red';
+        const statusText = connected
+          ? 'Connected as <b>'+esc(tg.username)+'</b> · Watching <b>'+esc(tg.channel)+'</b>'
+          : 'Disconnected' + (tg.error ? ' · '+esc(tg.error) : '');
+        const lastMsg = tg.last_message_at ? ' · Last msg: '+tg.last_message_at.slice(11,19)+' UTC' : '';
+        $('tg-status').innerHTML = '<span class="pulse-dot '+dotCls+'"></span> <span>'
+          + statusText + lastMsg + '</span>';
 
         // Stats
         let cards = '';
@@ -252,16 +306,16 @@ def _html() -> str:
         const headers = ['Pair','Side','Entry','Targets','SL','PnL','Status','TX','Opened'];
         const headerRow = '<tr>'+headers.map(h => '<th class="text-left py-2 px-3 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 whitespace-nowrap">'+h+'</th>').join('')+'</tr>';
 
-        const active = trades.filter(t => ['active','opening','pending'].includes(t.status));
-        const closed = trades.filter(t => !['active','opening','pending'].includes(t.status));
+        const activeTrades = trades.filter(t => ['active','opening','pending'].includes(t.status));
+        const closedTrades = trades.filter(t => !['active','opening','pending'].includes(t.status));
 
         let html = '';
-        if (active.length) {
-          html += '<table class="w-full"><thead>'+headerRow+'</thead><tbody>'+active.map(renderTrade).join('')+'</tbody></table>';
+        if (activeTrades.length) {
+          html += '<table class="w-full"><thead>'+headerRow+'</thead><tbody>'+activeTrades.map(renderTrade).join('')+'</tbody></table>';
         }
-        if (closed.length) {
+        if (closedTrades.length) {
           html += '<div class="px-5 py-2 border-t border-zinc-800 bg-zinc-900/30"><span class="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">History</span></div>';
-          html += '<table class="w-full"><thead>'+headerRow+'</thead><tbody>'+closed.map(renderTrade).join('')+'</tbody></table>';
+          html += '<table class="w-full"><thead>'+headerRow+'</thead><tbody>'+closedTrades.map(renderTrade).join('')+'</tbody></table>';
         }
         if (!trades.length) {
           html = '<div class="py-12 text-center text-zinc-600 text-sm">No trades yet</div>';
@@ -271,6 +325,29 @@ def _html() -> str:
         $('trades-container').style.display = 'block';
         $('trades-container').innerHTML = html;
         $('trade-count').textContent = stats.active + ' active · ' + stats.total + ' total';
+
+        // Telegram messages feed
+        if (messages && messages.length) {
+          $('msg-count').textContent = messages.length + ' messages';
+          $('messages-container').innerHTML = messages.map(m => {
+            const time = m.received_at ? m.received_at.slice(5,19).replace('T',' ') : '';
+            const editTag = m.is_edit ? '<span class="badge" style="background:rgba(234,179,8,0.15);color:#facc15;">EDIT</span> ' : '';
+            const signalTag = m.is_signal ? '<span class="badge badge-active">SIGNAL</span> ' : '';
+            const blockTag = m.block_reason ? '<span class="badge badge-error">'+esc(m.block_reason)+'</span> ' : '';
+            const textPreview = esc(m.text.slice(0, 200)) + (m.text.length > 200 ? '...' : '');
+            return '<div class="px-4 py-3 border-b border-zinc-800/50 hover:bg-white/[0.02]">'
+              + '<div class="flex items-center gap-2 mb-1">'
+              + '<span class="text-[11px] text-zinc-500 mono">'+time+'</span> '
+              + '<span class="text-[11px] text-zinc-600">#'+m.message_id+'</span> '
+              + editTag + signalTag + blockTag
+              + '</div>'
+              + '<p class="text-xs text-zinc-400 leading-relaxed whitespace-pre-line">'+textPreview+'</p>'
+              + '</div>';
+          }).join('');
+        } else {
+          $('messages-container').innerHTML = '<div class="py-8 text-center text-zinc-600 text-sm">No messages received yet</div>';
+        }
+
         $('ts').textContent = stats.timestamp || '';
       } catch(e) {
         $('loading').innerHTML = '<span class="text-red-400">'+e.message+'</span>';

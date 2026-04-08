@@ -108,3 +108,23 @@ class TelegramSignalMessage(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class TelegramMessage(Base):
+    """Log of all messages from the watched channel."""
+    __tablename__ = "telegram_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_edit: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_signal: Mapped[bool] = mapped_column(Boolean, default=False)
+    block_reason: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        Index("ix_tg_messages_channel_msg", "channel_id", "message_id"),
+    )

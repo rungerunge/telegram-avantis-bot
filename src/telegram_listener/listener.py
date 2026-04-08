@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..database.repository import TradeRepository, get_db_session
@@ -17,6 +18,15 @@ from .parser import get_block_reason, parse_signal_to_json
 SIGNAL_DELAY_SECONDS = 60
 
 logger = logging.getLogger(__name__)
+
+# Global Telegram status (read by dashboard API)
+telegram_status = {
+    "connected": False,
+    "username": None,
+    "channel": None,
+    "last_message_at": None,
+    "error": None,
+}
 logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -160,10 +170,29 @@ async def run_telegram_listener(trade_manager, settings):
     async def on_new_message(event):
         msg = event.message
         text = (msg.text or getattr(msg, "message", None) or "").strip()
-        if not _looks_like_signal(text):
-            return
 
         channel_id, message_id = _channel_and_id(event)
+        telegram_status["last_message_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Log every message to DB
+        is_signal = _looks_like_signal(text)
+        block_reason = None
+        if is_signal:
+            br, _ = get_block_reason(text)
+            block_reason = br
+        try:
+            async with get_db_session() as session:
+                repo = TradeRepository(session)
+                await repo.log_telegram_message(
+                    channel_id, message_id, text,
+                    is_edit=False, is_signal=is_signal, block_reason=block_reason,
+                )
+        except Exception as e:
+            logger.debug("Failed to log message: %s", e)
+
+        if not is_signal:
+            return
+
         key = (channel_id, message_id)
         if key in pending_signals:
             return
@@ -185,7 +214,26 @@ async def run_telegram_listener(trade_manager, settings):
     async def on_message_edited(event):
         msg = event.message
         text = (msg.text or getattr(msg, "message", None) or "").strip()
-        if not _looks_like_signal(text):
+
+        channel_id, message_id = _channel_and_id(event)
+
+        # Log edit to DB
+        is_signal = _looks_like_signal(text)
+        block_reason = None
+        if is_signal:
+            br, _ = get_block_reason(text)
+            block_reason = br
+        try:
+            async with get_db_session() as session:
+                repo = TradeRepository(session)
+                await repo.log_telegram_message(
+                    channel_id, message_id, text,
+                    is_edit=True, is_signal=is_signal, block_reason=block_reason,
+                )
+        except Exception as e:
+            logger.debug("Failed to log edit: %s", e)
+
+        if not is_signal:
             return
         channel_id, message_id = _channel_and_id(event)
         if (channel_id, message_id) in pending_signals:
@@ -244,7 +292,10 @@ async def run_telegram_listener(trade_manager, settings):
                     await _do_login()
 
                 me = await client.get_me()
-                logger.info("Telegram: logged in as %s", getattr(me, "first_name", me))
+                uname = getattr(me, "first_name", None) or str(me)
+                logger.info("Telegram: logged in as %s", uname)
+                telegram_status["username"] = uname
+                telegram_status["error"] = None
 
                 if entity is None:
                     channel_id = channel.strip()
@@ -262,10 +313,13 @@ async def run_telegram_listener(trade_manager, settings):
                     handlers_added = True
                     name = getattr(entity, "title", None) or str(entity)
                     logger.info("Telegram: watching %s", name)
+                    telegram_status["channel"] = name
 
+                telegram_status["connected"] = True
                 consecutive_failures = 0
                 auth_dup_retries = 0
                 await client.run_until_disconnected()
+                telegram_status["connected"] = False
 
             except asyncio.CancelledError:
                 break

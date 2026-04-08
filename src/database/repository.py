@@ -11,7 +11,7 @@ from typing import AsyncGenerator, List, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import select, update
 
-from .models import Base, Trade, TradeStatus, TradeDirection, TelegramSignalMessage
+from .models import Base, Trade, TradeStatus, TradeDirection, TelegramSignalMessage, TelegramMessage
 from ..config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -165,3 +165,26 @@ class TradeRepository:
             )
             self.session.add(msg)
         await self.session.flush()
+
+    # ── Telegram message log ─────────────────────────────────
+
+    async def log_telegram_message(
+        self, channel_id: str, message_id: int, text: str,
+        is_edit: bool = False, is_signal: bool = False, block_reason: str = None,
+    ) -> None:
+        msg = TelegramMessage(
+            channel_id=channel_id,
+            message_id=message_id,
+            text=text,
+            is_edit=is_edit,
+            is_signal=is_signal,
+            block_reason=block_reason,
+        )
+        self.session.add(msg)
+        await self.session.flush()
+
+    async def get_telegram_messages(self, limit: int = 50) -> list:
+        result = await self.session.execute(
+            select(TelegramMessage).order_by(TelegramMessage.received_at.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
