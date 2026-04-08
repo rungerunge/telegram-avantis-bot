@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..database.repository import TradeRepository, get_db_session
-from .parser import get_block_reason, parse_signal_to_json
+from .parser import get_block_reason, parse_signal_to_json, split_signals
 
 SIGNAL_DELAY_SECONDS = 60
 
@@ -123,44 +123,57 @@ async def run_telegram_listener(trade_manager, settings):
             if not text:
                 return
 
-            block_reason, obj = get_block_reason(text)
-            if block_reason is not None:
+            # Split into individual signals (handles multi-signal messages)
+            signal_blocks = split_signals(text)
+            if not signal_blocks:
+                # Try as single signal
+                signal_blocks = [text]
+
+            trade_count = 0
+            for block in signal_blocks:
+                block_reason, obj = get_block_reason(block)
+                if block_reason is not None:
+                    if debug_blocks:
+                        logger.info("Signal BLOCKED: %s", block_reason)
+                    continue
+
+                pair = obj["pair"].upper()
+                direction = obj["direction"].lower()
+                entry = float(obj["entry"])
+                targets = [float(t) for t in obj["targets"]]
+                stop_loss = float(obj["stop_loss"])
+                suggested_leverage = obj.get("suggested_leverage")
+                if suggested_leverage is not None:
+                    suggested_leverage = int(suggested_leverage)
+
+                try:
+                    trade = await trade_manager.create_trade(
+                        symbol=pair,
+                        direction=direction,
+                        entry_price=entry,
+                        targets=targets,
+                        stop_loss=stop_loss,
+                        suggested_leverage=suggested_leverage,
+                        notes=(obj.get("notes") or "").strip() or None,
+                        source="telegram",
+                    )
+                    trade_count += 1
+                    logger.info(
+                        "Signal -> trade: %s %s @ %s [%d targets]",
+                        pair, direction, trade.id[:8], len(targets),
+                    )
+                except Exception as e:
+                    logger.exception("create_trade failed for %s: %s", pair, e)
+
+            if trade_count > 0:
+                async with get_db_session() as session:
+                    repo = TradeRepository(session)
+                    await repo.set_telegram_message_status(channel_id, message_id, "complete")
+                logger.info("Processed %d signals from message %s", trade_count, message_id)
+            else:
                 async with get_db_session() as session:
                     repo = TradeRepository(session)
                     await repo.set_telegram_message_status(channel_id, message_id, "incomplete")
-                if debug_blocks:
-                    logger.info("Signal BLOCKED: %s", block_reason)
-                return
-
-            pair = obj["pair"].upper()
-            direction = obj["direction"].lower()
-            entry = float(obj["entry"])
-            targets = [float(t) for t in obj["targets"]]
-            stop_loss = float(obj["stop_loss"])
-            suggested_leverage = obj.get("suggested_leverage")
-            if suggested_leverage is not None:
-                suggested_leverage = int(suggested_leverage)
-
-            try:
-                trade = await trade_manager.create_trade(
-                    symbol=pair,
-                    direction=direction,
-                    entry_price=entry,
-                    targets=targets,
-                    stop_loss=stop_loss,
-                    suggested_leverage=suggested_leverage,
-                    notes=(obj.get("notes") or "").strip() or None,
-                    source="telegram",
-                )
-                async with get_db_session() as session:
-                    repo = TradeRepository(session)
-                    await repo.set_telegram_message_status(channel_id, message_id, "complete", trade_id=trade.id)
-                logger.info(
-                    "Signal -> trade: %s %s @ %s [%d targets]",
-                    pair, direction, trade.id[:8], len(targets),
-                )
-            except Exception as e:
-                logger.exception("create_trade failed: %s", e)
 
         except asyncio.CancelledError:
             pass

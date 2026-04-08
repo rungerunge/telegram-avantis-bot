@@ -71,6 +71,34 @@ def _extract_number(s: str):
         return None
 
 
+def split_signals(text: str) -> list[str]:
+    """
+    Split a message containing multiple signals into individual signal blocks.
+    Splits on lines matching the pair/direction header (e.g. "ETH/USDT Short 25x").
+    Returns list of signal text blocks.
+    """
+    if not text or not text.strip():
+        return []
+    lines = text.splitlines()
+    header_pattern = re.compile(r"^[A-Za-z0-9]+/USDT\s+(?:long|short)", re.IGNORECASE)
+
+    blocks = []
+    current_block = []
+    for line in lines:
+        stripped = line.strip()
+        if header_pattern.match(stripped) and current_block:
+            # New signal header found — save current block
+            blocks.append("\n".join(current_block))
+            current_block = [line]
+        else:
+            current_block.append(line)
+    if current_block:
+        blocks.append("\n".join(current_block))
+
+    # Only return blocks that look like actual signals
+    return [b for b in blocks if is_signal_message(b)]
+
+
 def parse_signal_to_json(text: str) -> dict:
     """
     Parse a signal message into JSON matching CreateTradeRequest:
