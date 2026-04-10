@@ -23,7 +23,7 @@ python-dotenv>=1.0.0
 telethon>=1.34.0
 
 # Lighter DEX SDK
-lighter-sdk @ git+https://github.com/elliottech/lighter-python.git
+lighter-sdk>=1.0.8
 
 # Utilities
 python-dateutil>=2.8.2
