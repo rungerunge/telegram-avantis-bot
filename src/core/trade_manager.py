@@ -10,12 +10,14 @@ Multi-target strategy:
 
 import asyncio
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from ..config import get_settings
 from ..avantis.client import AvantisClient
+from ..lighter.client import LighterClient
 from ..avantis.pairs import get_pair_index, get_price_symbol
 from ..avantis.prices import get_price
 from ..database.models import Trade, TradeStatus, TradeDirection
@@ -63,7 +65,13 @@ class TradeManager:
 
     async def initialize(self) -> None:
         settings = get_settings()
-        self.client = AvantisClient(settings)
+        exchange = os.environ.get("EXCHANGE", "avantis").lower()
+        if exchange == "lighter":
+            self.client = LighterClient(settings)
+            logger.info("Using LIGHTER executor (0%% fees)")
+        else:
+            self.client = AvantisClient(settings)
+            logger.info("Using AVANTIS executor")
 
         try:
             usdc = await self.client.get_usdc_balance()
