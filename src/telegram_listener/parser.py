@@ -114,8 +114,12 @@ def parse_signal_to_json(text: str) -> dict:
 
     direction = "short" if "short" in title else ("long" if "long" in title else "")
 
+    # Match "25x", "10x", or bare number after direction like "short 10"
     lev_match = re.search(r"(\d+)\s*x\b", lines[0], re.IGNORECASE)
-    suggested_leverage = int(lev_match.group(1)) if lev_match else None
+    if not lev_match:
+        # Try bare number after long/short: "BTC/USDT Swing short 10"
+        lev_match = re.search(r"(?:long|short)\s+(\d+)(?:\s|$|\()", lines[0], re.IGNORECASE)
+    suggested_leverage = int(lev_match.group(1)) if lev_match else 10  # Default 10x
 
     entry_line = _get_entry_line(lines)
     entry = _extract_number(entry_line)
