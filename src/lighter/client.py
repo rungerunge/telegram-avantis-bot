@@ -327,7 +327,7 @@ class LighterClient:
         is_ask = is_long
 
         # Get a worst-case price
-        best_price = self._signer.get_best_price(mkt["market_id"], is_ask)
+        best_price = await self._signer.get_best_price(mkt["market_id"], is_ask)
         if best_price <= 0:
             # Fallback: use position's avg entry with wide slippage
             entry = float(position.avg_entry_price)
