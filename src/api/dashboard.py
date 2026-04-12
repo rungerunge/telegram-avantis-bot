@@ -196,6 +196,17 @@ def _html() -> str:
       </div>
     </div>
 
+    <!-- Trade History -->
+    <div class="card overflow-hidden mb-6">
+      <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between">
+        <h3 class="text-sm font-semibold text-zinc-400">Trade History</h3>
+        <span id="history-count" class="text-xs text-zinc-600 mono"></span>
+      </div>
+      <div class="overflow-x-auto">
+        <div id="history-container" class="max-h-[500px] overflow-y-auto"></div>
+      </div>
+    </div>
+
     <!-- Telegram Message Feed -->
     <div class="card overflow-hidden">
       <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between">
@@ -347,6 +358,46 @@ def _html() -> str:
           }).join('');
         } else {
           $('messages-container').innerHTML = '<div class="py-8 text-center text-zinc-600 text-sm">No messages received yet</div>';
+        }
+
+        // Trade History — show all trades with full detail
+        const allTrades = [...trades].sort((a,b) => {
+          const ta = a.opened_at || a.created_at || '';
+          const tb = b.opened_at || b.created_at || '';
+          return tb.localeCompare(ta);
+        });
+        if (allTrades.length) {
+          const hHeaders = ['Time','Pair','Side','Leverage','Entry','Collateral','Targets Hit','SL','PnL','Status'];
+          const hRow = '<tr>'+hHeaders.map(h => '<th class="text-left py-2 px-3 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 whitespace-nowrap">'+h+'</th>').join('')+'</tr>';
+          const hBody = allTrades.map(t => {
+            const dir = t.direction || '';
+            const dirBadge = '<span class="badge badge-'+dir+'">'+dir.toUpperCase()+'</span>';
+            const targets = Array.isArray(t.targets) ? t.targets : [];
+            const currentIdx = t.current_target_idx || 0;
+            const targetsHit = currentIdx > 0 ? currentIdx + '/' + targets.length : '0/' + targets.length;
+            const targetsColor = currentIdx > 0 ? 'text-emerald-400' : 'text-zinc-500';
+            const time = t.opened_at ? t.opened_at.slice(5,16).replace('T',' ') : (t.created_at ? t.created_at.slice(5,16).replace('T',' ') : '—');
+            const statusCls = 'badge-' + t.status;
+            const pnlHtml = t.pnl_usd != null
+              ? '<span class="mono text-xs '+(t.pnl_usd >= 0 ? 'text-emerald-400' : 'text-red-400')+'">'+(t.pnl_usd >= 0 ? '+' : '')+'$'+t.pnl_usd.toFixed(2)+'</span>'
+              : '<span class="text-zinc-600">—</span>';
+            return '<tr class="border-b border-zinc-800/50">' +
+              '<td class="py-2.5 px-3 text-[11px] text-zinc-400 mono">'+time+'</td>' +
+              '<td class="py-2.5 px-3 text-sm font-semibold text-white">'+t.symbol+'</td>' +
+              '<td class="py-2.5 px-3">'+dirBadge+'</td>' +
+              '<td class="py-2.5 px-3 text-xs text-zinc-400 mono">'+t.leverage+'x</td>' +
+              '<td class="py-2.5 px-3 text-xs text-zinc-300 mono">'+t.entry_price+'</td>' +
+              '<td class="py-2.5 px-3 text-xs text-zinc-400 mono">$'+t.position_size_usd+'</td>' +
+              '<td class="py-2.5 px-3 text-xs '+targetsColor+' mono font-semibold">'+targetsHit+'</td>' +
+              '<td class="py-2.5 px-3 text-xs text-zinc-400 mono">'+t.stop_loss+'</td>' +
+              '<td class="py-2.5 px-3">'+pnlHtml+'</td>' +
+              '<td class="py-2.5 px-3"><span class="badge '+statusCls+'">'+t.status.toUpperCase()+'</span></td>' +
+            '</tr>';
+          }).join('');
+          $('history-container').innerHTML = '<table class="w-full"><thead>'+hRow+'</thead><tbody>'+hBody+'</tbody></table>';
+          $('history-count').textContent = allTrades.length + ' trades';
+        } else {
+          $('history-container').innerHTML = '<div class="py-8 text-center text-zinc-600 text-sm">No trade history</div>';
         }
 
         $('ts').textContent = stats.timestamp || '';
