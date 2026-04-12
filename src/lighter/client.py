@@ -303,7 +303,7 @@ class LighterClient:
             raise RuntimeError(f"No open position found for market {mkt['symbol']}")
 
         pos_sign = int(position.sign)  # 1 = long, -1 = short (typically)
-        pos_size = abs(int(position.position))  # base units
+        pos_size = int(abs(float(position.position)) * mkt["sz_scale"])  # convert decimal to base units
         is_long = pos_sign > 0
 
         if amount_usdc > 0 and pos_size > 0:
@@ -451,7 +451,7 @@ class LighterClient:
 
         for pos in acct.positions:
             if int(pos.market_id) == mkt["market_id"]:
-                pos_size = abs(int(pos.position))
+                pos_size = abs(float(pos.position))
                 if pos_size > 0:
                     return pos
         return None
@@ -474,7 +474,7 @@ class LighterClient:
 
             positions = []
             for pos in (acct.positions or []):
-                pos_size = abs(int(pos.position))
+                pos_size = abs(float(pos.position))
                 if pos_size == 0:
                     continue
 
