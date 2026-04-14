@@ -370,23 +370,24 @@ class TradeManager:
         if positions is None:
             return
 
-        open_on_chain = set()
+        # For Lighter: positions merge per pair, so check by pair_index only
+        open_pairs = set()
         for pos in positions:
             pi = int(pos.get("pairIndex", -1))
-            idx = int(pos.get("index", -1))
-            if pi >= 0 and idx >= 0:
-                open_on_chain.add((pi, idx))
+            if pi >= 0:
+                open_pairs.add(pi)
 
         closed_ids = []
         now = datetime.now(timezone.utc)
         for trade_id, at in list(self._active_trades.items()):
-            if at.pair_index is None or at.onchain_index is None:
+            if at.pair_index is None:
                 continue
             # Grace period: don't reconcile trades opened < 90s ago (API indexing delay)
             age = (now - at.opened_at).total_seconds()
             if age < 90:
                 continue
-            if (at.pair_index, at.onchain_index) not in open_on_chain:
+            # Only mark closed if NO position exists for this pair at all
+            if at.pair_index not in open_pairs:
                 logger.info("Trade %s closed on-chain (SL hit or liquidated)", trade_id[:8])
                 async with get_db_session() as session:
                     repo = TradeRepository(session)
