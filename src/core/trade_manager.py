@@ -76,6 +76,9 @@ class TradeManager:
         self.client: Optional[AvantisClient] = None
         self._running = False
         self._active_trades: Dict[str, ActiveTrade] = {}
+        # Trades waiting for price to reach signal entry before market-opening.
+        # trade_id → {"trade": Trade, "registered_at": datetime, "last_log_at": datetime}
+        self._pending_entries: Dict[str, dict] = {}
         self._monitor_task: Optional[asyncio.Task] = None
 
     async def initialize(self) -> None:
@@ -117,12 +120,26 @@ class TradeManager:
         async with get_db_session() as session:
             repo = TradeRepository(session)
             trades = await repo.get_active_trades()
+            active_count = 0
+            pending_count = 0
+            now = datetime.now(timezone.utc)
             for trade in trades:
+                # PENDING = not yet opened on exchange. Route to entry-wait queue
+                # so price monitor resumes waiting for signal entry instead of
+                # treating it as a live position.
+                if trade.status == TradeStatus.PENDING:
+                    self._pending_entries[trade.id] = {
+                        "trade": trade,
+                        "registered_at": trade.created_at or now,
+                        "last_log_at": now,
+                    }
+                    pending_count += 1
+                    continue
                 at = ActiveTrade(trade)
-                # Restore target index from DB
                 at.current_target_idx = trade.current_target_idx or 0
                 self._active_trades[trade.id] = at
-            logger.info("Loaded %d active trades", len(trades))
+                active_count += 1
+            logger.info("Loaded %d active + %d pending entries from DB", active_count, pending_count)
 
     # ── Trade Creation ───────────────────────────────────────
 
@@ -190,6 +207,24 @@ class TradeManager:
         asyncio.create_task(self._execute_trade(trade, current_price))
         return trade
 
+    def _entry_condition_met(self, trade: Trade, current_price: float) -> bool:
+        """True if current price is at signal entry or BETTER (so fill beats or equals signal).
+        SHORT: current >= entry (shorting higher is better)
+        LONG:  current <= entry (longing lower is better)
+        Applies tolerance (entry_wait_tolerance_pct) for slightly worse fills if configured.
+        """
+        settings = get_settings()
+        if not settings.entry_wait_enabled:
+            return True
+        tol = max(0.0, settings.entry_wait_tolerance_pct) / 100.0
+        is_long = trade.direction == TradeDirection.LONG
+        if is_long:
+            # Willing to pay up to entry * (1 + tol)
+            return current_price <= trade.entry_price * (1 + tol)
+        else:
+            # Willing to short down to entry * (1 - tol)
+            return current_price >= trade.entry_price * (1 - tol)
+
     async def _execute_trade(self, trade: Trade, current_price: float) -> None:
         settings = get_settings()
 
@@ -198,6 +233,23 @@ class TradeManager:
 
             targets = trade.targets if isinstance(trade.targets, list) else []
             is_long = trade.direction == TradeDirection.LONG
+
+            # Entry gating: if price is worse than signal entry, defer instead of
+            # market-filling at a bad price. Waits in _pending_entries; price
+            # monitor re-checks every interval.
+            if not self._entry_condition_met(trade, current_price):
+                side = "LONG" if is_long else "SHORT"
+                needed = "≤" if is_long else "≥"
+                logger.info(
+                    "[ENTRY WAIT] %s %s signal=%.2f current=%.2f (need %s %.2f) — queued, trade=%s",
+                    trade.symbol, side, trade.entry_price, current_price, needed, trade.entry_price, trade.id[:8],
+                )
+                now = datetime.now(timezone.utc)
+                self._pending_entries[trade.id] = {
+                    "trade": trade, "registered_at": now, "last_log_at": now,
+                }
+                # Status stays PENDING (already set by create_trade)
+                return
 
             if settings.dry_run:
                 logger.info(
@@ -260,12 +312,78 @@ class TradeManager:
                 await asyncio.sleep(interval)
                 if not self._running or not self.client:
                     break
+                await self._check_pending_entries()
                 await self._check_prices()
                 await self._reconcile_closed()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Price monitor error: %s", e)
+
+    async def _check_pending_entries(self) -> None:
+        """For each trade waiting on entry: fill it if price reaches signal, or cancel on timeout."""
+        if not self._pending_entries:
+            return
+
+        settings = get_settings()
+        now = datetime.now(timezone.utc)
+        max_wait = settings.entry_wait_max_minutes * 60
+        price_cache: Dict[str, float] = {}
+
+        for trade_id, info in list(self._pending_entries.items()):
+            trade: Trade = info["trade"]
+            price_sym = get_price_symbol(trade.pair_index)
+            if price_sym not in price_cache:
+                try:
+                    price_cache[price_sym] = await get_price(price_sym)
+                except Exception as e:
+                    logger.debug("pending entry: price fetch failed for %s: %s", trade.symbol, e)
+                    continue
+            current_price = price_cache[price_sym]
+
+            # Timeout — give up
+            age = (now - info["registered_at"]).total_seconds()
+            if age > max_wait:
+                logger.warning(
+                    "[ENTRY TIMEOUT] %s %s never reached signal entry %.2f within %dm — cancelling (current=%.2f)",
+                    trade.symbol, trade.direction.value, trade.entry_price,
+                    settings.entry_wait_max_minutes, current_price,
+                )
+                async with get_db_session() as session:
+                    repo = TradeRepository(session)
+                    await repo.update_trade_status(trade_id, TradeStatus.CANCELLED)
+                    await repo.update_trade_field(trade_id, "closed_at", now)
+                self._pending_entries.pop(trade_id, None)
+                continue
+
+            # Price reached signal entry (or better) — fill now
+            if self._entry_condition_met(trade, current_price):
+                logger.info(
+                    "[ENTRY FILL] %s %s reached %.2f (signal %.2f) — executing, waited %ds",
+                    trade.symbol, trade.direction.value, current_price, trade.entry_price, int(age),
+                )
+                self._pending_entries.pop(trade_id, None)
+                # Re-fetch trade row (status, etc.) and execute
+                async with get_db_session() as session:
+                    repo = TradeRepository(session)
+                    fresh = await repo.get_trade(trade_id)
+                if fresh is None or fresh.status.value not in ("pending", "opening"):
+                    logger.info("Trade %s no longer pending (%s) — skip fill", trade_id[:8], fresh.status.value if fresh else "missing")
+                    continue
+                asyncio.create_task(self._execute_trade(fresh, current_price))
+                continue
+
+            # Still waiting — periodic status log (every ~2 min)
+            last_log_age = (now - info["last_log_at"]).total_seconds()
+            if last_log_age > 120:
+                side = "LONG" if trade.direction == TradeDirection.LONG else "SHORT"
+                needed = "≤" if trade.direction == TradeDirection.LONG else "≥"
+                remaining = int(max_wait - age)
+                logger.info(
+                    "[ENTRY WAIT] %s %s current=%.2f signal=%.2f (need %s %.2f) waiting %ds more",
+                    trade.symbol, side, current_price, trade.entry_price, needed, trade.entry_price, remaining,
+                )
+                info["last_log_at"] = now
 
     async def _check_prices(self) -> None:
         """Check current prices against active trade targets."""

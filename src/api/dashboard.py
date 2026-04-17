@@ -186,7 +186,21 @@ async def dashboard_data():
 
                 status_val = t.status.value
                 is_active = status_val in ("active", "opening", "pending")
+                is_pending = status_val == "pending"
                 is_long = t.direction.value == "long"
+
+                # Entry-wait info for PENDING trades — how far is current price from signal entry?
+                if is_pending and current_price and t.entry_price:
+                    if is_long:
+                        # LONG needs current ≤ entry. distance > 0 means price is ABOVE (waiting to drop)
+                        pct_away = (current_price - t.entry_price) / t.entry_price * 100
+                        entry_ready = current_price <= t.entry_price
+                    else:
+                        # SHORT needs current ≥ entry. distance > 0 means price is BELOW (waiting to rise)
+                        pct_away = (t.entry_price - current_price) / t.entry_price * 100
+                        entry_ready = current_price >= t.entry_price
+                    td["entry_ready"] = entry_ready
+                    td["entry_distance_pct"] = round(pct_away, 3)
 
                 # Attach live Lighter data if the position is actually still open
                 live = live_by_pair.get(t.pair_index) if t.pair_index is not None else None
@@ -223,18 +237,21 @@ async def dashboard_data():
                     td["pnl_pct"] = round(pnl_pct, 2)
                     stats["open_pnl_usd"] += upnl
                 elif is_active and current_price:
-                    # Active in DB but no live match (stale) — compute from price feed.
+                    # Active in DB but no live match. Two cases:
+                    #  - PENDING: waiting for entry, no position expected yet → not stale
+                    #  - ACTIVE/OPENING: should have a position → stale if none
                     if is_long:
                         pnl_pct = ((current_price - t.entry_price) / t.entry_price) * 100 * t.leverage
                         pnl_usd = (current_price - t.entry_price) / t.entry_price * t.position_size_usd * t.leverage
                     else:
                         pnl_pct = ((t.entry_price - current_price) / t.entry_price) * 100 * t.leverage
                         pnl_usd = (t.entry_price - current_price) / t.entry_price * t.position_size_usd * t.leverage
-                    td["pnl_usd"] = round(pnl_usd, 2)
-                    td["pnl_pct"] = round(pnl_pct, 2)
+                    td["pnl_usd"] = None if is_pending else round(pnl_usd, 2)
+                    td["pnl_pct"] = None if is_pending else round(pnl_pct, 2)
                     td["live"] = None
-                    td["stale"] = True  # DB says active but Lighter has nothing
-                    stats["open_pnl_usd"] += pnl_usd
+                    td["stale"] = not is_pending  # PENDING is expected to have no live match
+                    if not is_pending:
+                        stats["open_pnl_usd"] += pnl_usd
                 else:
                     # Closed or error — use stored realized PnL
                     rp = td.get("realized_pnl_usd")
@@ -708,6 +725,11 @@ def _html() -> str:
       const statusBadge = '<span class="badge '+statusCls+'">'+(t.status||'').toUpperCase()+'</span>';
       const staleBadge = t.stale ? '<span class="badge badge-error" title="DB says active, Lighter has no position — reconciling">⚠ STALE</span>' : '';
       const liveBadge = t.live ? '<span class="badge" style="background:rgba(74,222,128,0.1);color:#86efac;" title="Live on Lighter">● LIVE</span>' : '';
+      const waitBadge = (t.status === 'pending') ? (
+        t.entry_ready
+          ? '<span class="badge badge-active" title="Entry condition met — opening shortly">⏳ ENTERING</span>'
+          : '<span class="badge" style="background:rgba(234,179,8,0.15);color:#facc15;" title="Waiting for price to reach signal entry">⏸ WAITING FOR ENTRY</span>'
+      ) : '';
       const pnl = t.pnl_usd;
       const pnlCls = pnl == null ? 'text-zinc-500' : pnl >= 0 ? 'text-emerald-400' : 'text-red-400';
       const pnlTxt = pnl == null ? '—' : (pnl >= 0 ? '+' : '−') + '$' + Math.abs(pnl).toFixed(2);
@@ -752,13 +774,36 @@ def _html() -> str:
             '<span class="text-zinc-600 text-xs">·</span>' +
             '<span class="text-zinc-400 text-xs">$'+t.position_size_usd+' col</span>' +
             '<span class="text-zinc-600 text-xs">·</span>' +
-            statusBadge + liveBadge + staleBadge +
+            statusBadge + liveBadge + staleBadge + waitBadge +
           '</div>' +
           '<div class="text-right">' +
             '<div class="mono text-lg font-bold '+pnlCls+'">'+pnlTxt+'</div>' +
             '<div class="text-[11px] '+pnlCls+' opacity-80">'+pnlPctTxt+(t.live?' · live':'')+'</div>' +
           '</div>' +
         '</div>' +
+        // Entry-wait status row (PENDING only) — very visible, explains why nothing is happening yet
+        ((t.status === 'pending') ? (function() {
+          const needed = dir === 'long' ? '≤' : '≥';
+          const diff = t.entry_distance_pct;
+          const diffTxt = (diff != null)
+            ? '<span class="mono ' + (t.entry_ready ? 'text-emerald-400' : 'text-amber-300') + '">'
+              + (diff >= 0 ? '+' : '') + diff.toFixed(3) + '%</span> away'
+            : '';
+          const explainer = t.entry_ready
+            ? 'Entry condition met — bot will open on next tick'
+            : 'Current price is '+(dir === 'long' ? 'above' : 'below')+' signal entry. Waiting for '+needed+' $'+(t.entry_price||0).toFixed(2)+'.';
+          return '<div class="mb-3 p-3 rounded-lg" style="background:rgba(234,179,8,0.06);border:1px solid rgba(234,179,8,0.2);">' +
+              '<div class="flex items-center justify-between text-[12px]">' +
+                '<div>' +
+                  '<span class="text-amber-300 font-semibold">⏸ Waiting for entry.</span> ' +
+                  '<span class="text-zinc-400">Signal $</span><span class="mono text-zinc-200">'+(t.entry_price||0).toFixed(2)+'</span> ' +
+                  '<span class="text-zinc-500">· now </span><span class="mono text-zinc-200">$'+(t.current_price||0).toFixed(2)+'</span> ' +
+                  diffTxt +
+                '</div>' +
+              '</div>' +
+              '<div class="text-[11px] text-zinc-500 mt-1">'+explainer+'</div>' +
+            '</div>';
+        })() : '') +
         // Price scale
         priceScale(t) +
         // SL progression row

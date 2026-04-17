@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     # Reconciliation
     reconciliation_interval: int = Field(default=15, description="Seconds between position checks")
 
+    # Entry gating — don't market-open at a worse price than the signal entry.
+    # For SHORT: wait until current >= entry_price. For LONG: wait until current <= entry_price.
+    entry_wait_enabled: bool = Field(default=True, description="Wait for price to reach signal entry before opening")
+    entry_wait_tolerance_pct: float = Field(default=0.0, description="Allow entry this % worse than signal (0 = strict)")
+    entry_wait_max_minutes: int = Field(default=30, description="Cancel pending entry if not reached within N minutes")
+
     # Telegram signal listener
     enable_telegram_listener: bool = Field(default=False)
     telegram_api_id: str = Field(default="")
