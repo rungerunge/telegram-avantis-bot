@@ -20,6 +20,24 @@ _engine = None
 _session_factory = None
 
 
+async def _migrate_schema(conn) -> None:
+    """Idempotent SQLite column additions. create_all doesn't ALTER existing tables."""
+    migrations = [
+        "ALTER TABLE trades ADD COLUMN close_price FLOAT",
+        "ALTER TABLE trades ADD COLUMN realized_pnl_usd FLOAT",
+        "ALTER TABLE trades ADD COLUMN closed_qty_usd FLOAT",
+    ]
+    for sql in migrations:
+        try:
+            await conn.exec_driver_sql(sql)
+            logger.info("Schema migration applied: %s", sql)
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                continue
+            logger.warning("Schema migration skipped (%s): %s", sql, e)
+
+
 async def init_database() -> None:
     global _engine, _session_factory
     settings = get_settings()
@@ -29,6 +47,7 @@ async def init_database() -> None:
 
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _migrate_schema(conn)
 
     logger.info("Database initialized")
 

@@ -60,16 +60,42 @@ async def dashboard_data():
     stats = {
         "active": 0, "closed": 0, "error": 0, "total": 0,
         "usdc_balance": None, "eth_balance": None,
-        "total_pnl_usd": 0, "open_pnl_usd": 0,
+        "realized_pnl_usd": 0.0, "open_pnl_usd": 0.0, "total_pnl_usd": 0.0,
+        "live_untracked": 0,
     }
 
-    # Fetch current prices
+    # Fetch current prices (for PnL fallback if Lighter uPnL unavailable)
     prices = {}
     for sym in ["ETHUSDT", "BTCUSDT"]:
         try:
             prices[sym] = await get_price(sym)
         except Exception:
             pass
+
+    # Fetch LIVE positions from Lighter — this is the source of truth for
+    # what's actually open. DB can lag behind (reconciliation every N seconds).
+    live_positions: list[dict] = []
+    try:
+        tm = get_trade_manager()
+        if tm and tm.client and hasattr(tm.client, "get_open_positions"):
+            live = await tm.client.get_open_positions()
+            if live:
+                live_positions = live
+    except Exception:
+        live_positions = []
+
+    # Index live positions by pair_index — Lighter merges per pair so there's
+    # at most one position per pair_index (direction derived from sign).
+    live_by_pair: dict[int, dict] = {}
+    for p in live_positions:
+        try:
+            pi = int(p.get("pairIndex", -1))
+            if pi >= 0:
+                live_by_pair[pi] = p
+        except Exception:
+            continue
+
+    matched_pairs: set[int] = set()
 
     try:
         async with get_db_session() as session:
@@ -78,7 +104,6 @@ async def dashboard_data():
             for t in trades:
                 td = t.to_dict()
 
-                # Enrich with current price and PnL
                 price_sym = t.symbol.upper()
                 if not price_sym.endswith("USDT"):
                     price_sym = price_sym.replace("USD", "") + "USDT"
@@ -90,9 +115,46 @@ async def dashboard_data():
                 # SL progression (derived from current_target_idx)
                 td.update(_sl_progression(td))
 
-                # PnL for active trades
-                if current_price and t.status.value in ("active", "opening"):
-                    is_long = t.direction.value == "long"
+                status_val = t.status.value
+                is_active = status_val in ("active", "opening", "pending")
+                is_long = t.direction.value == "long"
+
+                # Attach live Lighter data if the position is actually still open
+                live = live_by_pair.get(t.pair_index) if t.pair_index is not None else None
+                live_sign_matches = False
+                if live is not None:
+                    live_is_long = int(live.get("sign", 0)) == 1
+                    live_sign_matches = (live_is_long == is_long)
+
+                if live is not None and live_sign_matches and is_active:
+                    matched_pairs.add(t.pair_index)
+                    try:
+                        upnl = float(live.get("unrealized_pnl") or 0.0)
+                    except (TypeError, ValueError):
+                        upnl = 0.0
+                    try:
+                        live_size = float(live.get("position") or 0.0)
+                    except (TypeError, ValueError):
+                        live_size = 0.0
+                    try:
+                        live_entry = float(live.get("avg_entry_price") or t.entry_price)
+                    except (TypeError, ValueError):
+                        live_entry = t.entry_price
+
+                    td["live"] = {
+                        "size": live_size,
+                        "entry": live_entry,
+                        "unrealized_pnl": upnl,
+                        "liquidation_price": live.get("liquidation_price"),
+                        "allocated_margin": live.get("allocated_margin"),
+                    }
+                    # Use Lighter's uPnL as the authoritative PnL
+                    td["pnl_usd"] = round(upnl, 2)
+                    pnl_pct = (upnl / t.position_size_usd * 100) if t.position_size_usd else 0.0
+                    td["pnl_pct"] = round(pnl_pct, 2)
+                    stats["open_pnl_usd"] += upnl
+                elif is_active and current_price:
+                    # Active in DB but no live match (stale) — compute from price feed.
                     if is_long:
                         pnl_pct = ((current_price - t.entry_price) / t.entry_price) * 100 * t.leverage
                         pnl_usd = (current_price - t.entry_price) / t.entry_price * t.position_size_usd * t.leverage
@@ -101,27 +163,77 @@ async def dashboard_data():
                         pnl_usd = (t.entry_price - current_price) / t.entry_price * t.position_size_usd * t.leverage
                     td["pnl_usd"] = round(pnl_usd, 2)
                     td["pnl_pct"] = round(pnl_pct, 2)
+                    td["live"] = None
+                    td["stale"] = True  # DB says active but Lighter has nothing
                     stats["open_pnl_usd"] += pnl_usd
                 else:
-                    td["pnl_usd"] = None
-                    td["pnl_pct"] = None
+                    # Closed or error — use stored realized PnL
+                    rp = td.get("realized_pnl_usd")
+                    if rp is not None:
+                        td["pnl_usd"] = round(float(rp), 2)
+                        if t.position_size_usd:
+                            td["pnl_pct"] = round(float(rp) / t.position_size_usd * 100, 2)
+                        else:
+                            td["pnl_pct"] = None
+                    else:
+                        td["pnl_usd"] = None
+                        td["pnl_pct"] = None
 
                 trades_list.append(td)
                 stats["total"] += 1
-                if t.status.value in ("active", "opening", "pending"):
+                if is_active:
                     stats["active"] += 1
-                elif t.status.value == "closed":
+                elif status_val == "closed":
                     stats["closed"] += 1
-                elif t.status.value == "error":
+                    if td.get("realized_pnl_usd") is not None:
+                        stats["realized_pnl_usd"] += float(td["realized_pnl_usd"])
+                elif status_val == "error":
                     stats["error"] += 1
     except Exception:
         pass
 
+    # Surface any LIVE positions that aren't linked to an active DB trade
+    # (e.g. manually opened on Lighter, or DB got cleared). Shown as read-only rows.
+    untracked = []
+    for pi, live in live_by_pair.items():
+        if pi in matched_pairs:
+            continue
+        try:
+            size = abs(float(live.get("position") or 0))
+        except (TypeError, ValueError):
+            size = 0.0
+        if size <= 0:
+            continue
+        is_long = int(live.get("sign", 0)) == 1
+        try:
+            entry = float(live.get("avg_entry_price") or 0)
+        except (TypeError, ValueError):
+            entry = 0.0
+        try:
+            upnl = float(live.get("unrealized_pnl") or 0)
+        except (TypeError, ValueError):
+            upnl = 0.0
+        untracked.append({
+            "pair_index": pi,
+            "symbol": live.get("symbol") or f"pair#{pi}",
+            "direction": "long" if is_long else "short",
+            "size": size,
+            "entry_price": entry,
+            "unrealized_pnl": round(upnl, 2),
+            "liquidation_price": live.get("liquidation_price"),
+            "allocated_margin": live.get("allocated_margin"),
+        })
+        stats["open_pnl_usd"] += upnl
+    stats["live_untracked"] = len(untracked)
+
     stats["open_pnl_usd"] = round(stats["open_pnl_usd"], 2)
+    stats["realized_pnl_usd"] = round(stats["realized_pnl_usd"], 2)
+    stats["total_pnl_usd"] = round(stats["open_pnl_usd"] + stats["realized_pnl_usd"], 2)
+    stats["live_open_count"] = len([p for p in live_positions if abs(float(p.get("position") or 0)) > 0])
 
     try:
         tm = get_trade_manager()
-        if tm.client:
+        if tm and tm.client:
             stats["usdc_balance"] = round(await tm.client.get_usdc_balance(), 2)
             stats["eth_balance"] = round(float(await tm.client.get_eth_balance()), 6)
     except Exception:
@@ -168,7 +280,7 @@ async def dashboard_data():
         pass
 
     stats["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return {"trades": trades_list, "stats": stats, "messages": tg_messages}
+    return {"trades": trades_list, "stats": stats, "messages": tg_messages, "untracked": untracked}
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
@@ -450,12 +562,42 @@ def _html() -> str:
         '</div>';
     }
 
+    // Untracked live position — exists on Lighter but no matching DB trade
+    function renderUntrackedCard(p) {
+      const dir = p.direction || '';
+      const dirBadge = '<span class="badge badge-'+dir+'">'+dir.toUpperCase()+'</span>';
+      const pnl = p.unrealized_pnl || 0;
+      const pnlCls = pnl >= 0 ? 'text-emerald-400' : 'text-red-400';
+      const pnlTxt = (pnl >= 0 ? '+' : '−') + '$' + Math.abs(pnl).toFixed(2);
+      return '<div class="card p-4 border-amber-500/30">' +
+        '<div class="flex items-start justify-between mb-2">' +
+          '<div class="flex items-center gap-2 flex-wrap">' +
+            '<span class="font-bold text-white text-base">'+esc(p.symbol)+'</span>' +
+            dirBadge +
+            '<span class="badge badge-pending">LIVE · no DB match</span>' +
+          '</div>' +
+          '<div class="text-right">' +
+            '<div class="mono text-lg font-bold '+pnlCls+'">'+pnlTxt+'</div>' +
+            '<div class="text-[10px] text-zinc-500">unrealized</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="flex gap-4 text-[11px] text-zinc-400 mono flex-wrap">' +
+          '<span>Size: <span class="text-zinc-200">'+p.size.toFixed(4)+'</span></span>' +
+          '<span>Entry: <span class="text-zinc-200">$'+(p.entry_price||0).toFixed(2)+'</span></span>' +
+          (p.liquidation_price ? '<span>Liq: <span class="text-red-400">$'+parseFloat(p.liquidation_price).toFixed(2)+'</span></span>' : '') +
+          (p.allocated_margin ? '<span>Margin: <span class="text-zinc-200">$'+parseFloat(p.allocated_margin).toFixed(2)+'</span></span>' : '') +
+        '</div>' +
+      '</div>';
+    }
+
     // One card per active trade
     function renderCard(t) {
       const dir = t.direction || '';
       const dirBadge = '<span class="badge badge-'+dir+'">'+dir.toUpperCase()+'</span>';
       const statusCls = 'badge-' + (t.status || 'pending');
       const statusBadge = '<span class="badge '+statusCls+'">'+(t.status||'').toUpperCase()+'</span>';
+      const staleBadge = t.stale ? '<span class="badge badge-error" title="DB says active, Lighter has no position — reconciling">⚠ STALE</span>' : '';
+      const liveBadge = t.live ? '<span class="badge" style="background:rgba(74,222,128,0.1);color:#86efac;" title="Live on Lighter">● LIVE</span>' : '';
       const pnl = t.pnl_usd;
       const pnlCls = pnl == null ? 'text-zinc-500' : pnl >= 0 ? 'text-emerald-400' : 'text-red-400';
       const pnlTxt = pnl == null ? '—' : (pnl >= 0 ? '+' : '−') + '$' + Math.abs(pnl).toFixed(2);
@@ -475,6 +617,21 @@ def _html() -> str:
         ? '<span class="text-zinc-500">· Next T' + (hitIdx + 1) + ' at <span class="mono text-zinc-300">' + nextTarget.toFixed(2) + '</span></span>'
         : '<span class="text-zinc-500">· all targets hit</span>';
 
+      // Live (Lighter) details row — position size, liq price, entry mismatch
+      let liveRow = '';
+      if (t.live) {
+        const liveSize = (t.live.size != null) ? Math.abs(t.live.size).toFixed(4) : '—';
+        const liqP = t.live.liquidation_price ? '$' + parseFloat(t.live.liquidation_price).toFixed(2) : '—';
+        const margin = t.live.allocated_margin ? '$' + parseFloat(t.live.allocated_margin).toFixed(2) : '—';
+        const entryMismatch = (t.live.entry && t.entry_price && Math.abs(t.live.entry - t.entry_price) / t.entry_price > 0.002)
+          ? ' <span class="text-amber-400 text-[10px]">live entry $'+t.live.entry.toFixed(2)+' (merged)</span>' : '';
+        liveRow = '<div class="flex items-center gap-4 mt-2 text-[11px] text-zinc-400 mono flex-wrap">' +
+          '<span>● Live size <span class="text-zinc-200">'+liveSize+'</span>'+entryMismatch+'</span>' +
+          '<span>Liq <span class="text-red-400">'+liqP+'</span></span>' +
+          '<span>Margin <span class="text-zinc-200">'+margin+'</span></span>' +
+          '</div>';
+      }
+
       return '<div class="card p-4" data-tid="'+esc(t.id)+'">' +
         // Header row
         '<div class="flex items-start justify-between mb-3">' +
@@ -485,17 +642,19 @@ def _html() -> str:
             '<span class="text-zinc-600 text-xs">·</span>' +
             '<span class="text-zinc-400 text-xs">$'+t.position_size_usd+' col</span>' +
             '<span class="text-zinc-600 text-xs">·</span>' +
-            statusBadge +
+            statusBadge + liveBadge + staleBadge +
           '</div>' +
           '<div class="text-right">' +
             '<div class="mono text-lg font-bold '+pnlCls+'">'+pnlTxt+'</div>' +
-            '<div class="text-[11px] '+pnlCls+' opacity-80">'+pnlPctTxt+'</div>' +
+            '<div class="text-[11px] '+pnlCls+' opacity-80">'+pnlPctTxt+(t.live?' · live':'')+'</div>' +
           '</div>' +
         '</div>' +
         // Price scale
         priceScale(t) +
         // SL progression row
         '<div class="mt-3">' + slProgressionRow(t) + '</div>' +
+        // Live details (if present)
+        liveRow +
         // Targets + metadata
         '<div class="flex items-center justify-between mt-2 text-[11px] text-zinc-500">' +
           '<div>' + hitInfo + ' ' + nextTxt + '</div>' +
@@ -571,18 +730,23 @@ def _html() -> str:
         let cards = '';
         if (stats.usdc_balance != null) cards += statCard('USDC', '$'+stats.usdc_balance.toLocaleString(undefined,{minimumFractionDigits:2}), {accent:true});
         if (stats.eth_balance != null) cards += statCard('ETH', stats.eth_balance.toFixed(6), {accent:true});
-        cards += statCard('Active', stats.active || 0);
+        const liveCount = stats.live_open_count || 0;
+        cards += statCard('Open (live)', liveCount + (stats.active != null && stats.active !== liveCount ? ' / DB '+stats.active : ''));
         cards += statCard('Closed', stats.closed || 0);
         const openPnl = stats.open_pnl_usd || 0;
-        cards += statCard('Open PnL', (openPnl >= 0 ? '+' : '−') + '$' + Math.abs(openPnl).toFixed(2), {positive: openPnl >= 0, negative: openPnl < 0});
-        cards += statCard('Total', stats.total || 0);
+        cards += statCard('Open uPnL', (openPnl >= 0 ? '+' : '−') + '$' + Math.abs(openPnl).toFixed(2), {positive: openPnl >= 0, negative: openPnl < 0});
+        const realPnl = stats.realized_pnl_usd || 0;
+        cards += statCard('Realized PnL', (realPnl >= 0 ? '+' : '−') + '$' + Math.abs(realPnl).toFixed(2), {positive: realPnl >= 0, negative: realPnl < 0});
         $('stats').innerHTML = cards;
 
         // Active positions (cards)
         const active = trades.filter(function(t){ return ['active','opening','pending'].indexOf(t.status) >= 0; });
-        $('active-count').textContent = active.length + ' position' + (active.length === 1 ? '' : 's');
-        if (active.length) {
-          $('positions-container').innerHTML = active.map(renderCard).join('');
+        const untracked = resp.untracked || [];
+        const totalActive = active.length + untracked.length;
+        $('active-count').textContent = totalActive + ' position' + (totalActive === 1 ? '' : 's') +
+          (untracked.length ? ' · ' + untracked.length + ' untracked live' : '');
+        if (totalActive) {
+          $('positions-container').innerHTML = active.map(renderCard).join('') + untracked.map(renderUntrackedCard).join('');
         } else {
           $('positions-container').innerHTML = '<div class="card p-8 text-center text-zinc-600 text-sm">No active positions</div>';
         }

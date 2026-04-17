@@ -67,6 +67,11 @@ class Trade(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
+    # Realized PnL — accumulated across partial closes, finalized at full close
+    close_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    realized_pnl_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    closed_qty_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     __table_args__ = (
         Index("ix_trades_status_symbol", "status", "symbol"),
     )
@@ -90,6 +95,9 @@ class Trade(Base):
             "closed_at": self.closed_at.isoformat() if self.closed_at else None,
             "notes": self.notes,
             "source": self.source,
+            "close_price": self.close_price,
+            "realized_pnl_usd": self.realized_pnl_usd,
+            "closed_qty_usd": self.closed_qty_usd,
         }
 
 

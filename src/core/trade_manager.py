@@ -44,6 +44,21 @@ class ActiveTrade:
         self.is_long = trade.direction == TradeDirection.LONG
         self.remaining_collateral = trade.position_size_usd
         self.opened_at = datetime.now(timezone.utc)  # grace period for API indexing
+        # Running realized PnL — accumulated across partial closes
+        self.realized_pnl_usd: float = float(trade.realized_pnl_usd or 0.0)
+        self.closed_qty_usd: float = float(trade.closed_qty_usd or 0.0)
+
+
+def _compute_realized_pnl(at: "ActiveTrade", close_price: float, close_qty_usd: float) -> float:
+    """PnL for closing close_qty_usd of collateral at close_price.
+    Matches Lighter's isolated-margin semantics: pnl = notional_delta * leverage / entry.
+    """
+    if close_price is None or at.entry_price <= 0 or close_qty_usd <= 0:
+        return 0.0
+    price_change = (close_price - at.entry_price) / at.entry_price
+    if not at.is_long:
+        price_change = -price_change
+    return price_change * close_qty_usd * at.leverage
 
 
 class TradeManager:
@@ -313,6 +328,7 @@ class TradeManager:
         num_targets = len(at.targets)
         target_idx = at.current_target_idx
         is_last_target = (target_idx == num_targets - 1)
+        target_price = at.targets[target_idx]
 
         # Calculate partial close amount
         # Each target gets equal share of the original collateral
@@ -323,6 +339,7 @@ class TradeManager:
                 # Last target — close entire remaining position
                 logger.info("Last target hit — closing full remaining position for %s", at.trade_id[:8])
                 await self.client.close_trade(at.pair_index, at.onchain_index, 0)
+                close_qty = max(0.0, at.remaining_collateral)
             else:
                 # Partial close
                 logger.info(
@@ -330,6 +347,7 @@ class TradeManager:
                     close_amount, at.trade_id[:8], target_idx + 1, num_targets,
                 )
                 await self.client.close_trade(at.pair_index, at.onchain_index, close_amount)
+                close_qty = close_amount
 
                 # Move SL to break-even (entry price) after first target,
                 # then to each subsequent target
@@ -341,18 +359,30 @@ class TradeManager:
                 logger.info("Moving SL to %.2f for %s", new_sl, at.trade_id[:8])
                 await self.client.update_sl(at.pair_index, at.onchain_index, new_sl)
 
+            # Realized PnL for this partial/full close (uses target price as fill price)
+            pnl_slice = _compute_realized_pnl(at, target_price, close_qty)
+            at.realized_pnl_usd += pnl_slice
+            at.closed_qty_usd += close_qty
+            logger.info(
+                "Realized PnL slice for %s: %+.2f (cumulative %+.2f on $%.2f closed)",
+                at.trade_id[:8], pnl_slice, at.realized_pnl_usd, at.closed_qty_usd,
+            )
+
             at.current_target_idx += 1
             at.remaining_collateral -= close_amount
 
             async with get_db_session() as session:
                 repo = TradeRepository(session)
                 await repo.update_trade_field(at.trade_id, "current_target_idx", at.current_target_idx)
+                await repo.update_trade_field(at.trade_id, "realized_pnl_usd", round(at.realized_pnl_usd, 4))
+                await repo.update_trade_field(at.trade_id, "closed_qty_usd", round(at.closed_qty_usd, 4))
 
             if is_last_target:
                 async with get_db_session() as session:
                     repo = TradeRepository(session)
                     await repo.update_trade_status(at.trade_id, TradeStatus.CLOSED)
                     await repo.update_trade_field(at.trade_id, "closed_at", datetime.now(timezone.utc))
+                    await repo.update_trade_field(at.trade_id, "close_price", target_price)
                 self._active_trades.pop(at.trade_id, None)
                 logger.info("Trade %s fully closed (all targets hit)", at.trade_id[:8])
 
@@ -388,11 +418,36 @@ class TradeManager:
                 continue
             # Only mark closed if NO position exists for this pair at all
             if at.pair_index not in open_pairs:
-                logger.info("Trade %s closed on-chain (SL hit or liquidated)", trade_id[:8])
+                # Fetch current market price to estimate close price + realized PnL.
+                # Unknown whether SL hit exactly, got slipped, or liquidated — this is
+                # an approximation using the current market at detection time.
+                close_price = None
+                try:
+                    from ..avantis.pairs import get_price_symbol
+                    price_sym = get_price_symbol(at.symbol) if hasattr(at, "symbol") else at.symbol.upper()
+                    close_price = await get_price(price_sym)
+                except Exception as e:
+                    logger.debug("Reconcile: price fetch failed for %s: %s", at.symbol, e)
+
+                if close_price is not None and at.remaining_collateral > 0:
+                    pnl_slice = _compute_realized_pnl(at, close_price, at.remaining_collateral)
+                    at.realized_pnl_usd += pnl_slice
+                    at.closed_qty_usd += at.remaining_collateral
+                    logger.info(
+                        "Trade %s reconciled closed at ~%.2f: PnL %+.2f (total %+.2f)",
+                        trade_id[:8], close_price, pnl_slice, at.realized_pnl_usd,
+                    )
+                else:
+                    logger.info("Trade %s closed on-chain (SL hit or liquidated) — PnL unknown", trade_id[:8])
+
                 async with get_db_session() as session:
                     repo = TradeRepository(session)
                     await repo.update_trade_status(trade_id, TradeStatus.CLOSED)
                     await repo.update_trade_field(trade_id, "closed_at", datetime.now(timezone.utc))
+                    if close_price is not None:
+                        await repo.update_trade_field(trade_id, "close_price", close_price)
+                        await repo.update_trade_field(trade_id, "realized_pnl_usd", round(at.realized_pnl_usd, 4))
+                        await repo.update_trade_field(trade_id, "closed_qty_usd", round(at.closed_qty_usd, 4))
                 closed_ids.append(trade_id)
 
         for tid in closed_ids:
