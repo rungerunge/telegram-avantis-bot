@@ -18,6 +18,75 @@ from fastapi.responses import HTMLResponse, JSONResponse
 router = APIRouter(tags=["Dashboard"])
 
 
+def _estimate_close_for_closed_trade(td: dict) -> tuple[float | None, float, float]:
+    """For a closed trade with no recorded PnL, derive (close_price, realized_pnl, closed_qty)
+    from the bot's deterministic progression rule.
+
+    Rules (matching core/trade_manager.py:_handle_target_hit + _reconcile_closed):
+      - idx == N (all targets hit): each target closed position_size/N at targets[i]
+      - 0 < idx < N (partial hits + SL/reconcile): N partial closes at target prices,
+        remainder closed at the effective SL at that stage
+      - idx == 0 (no target hit, SL or cancel): full position closed at initial stop_loss
+    """
+    direction = td.get("direction")
+    entry = td.get("entry_price")
+    leverage = td.get("leverage") or 0
+    position = td.get("position_size_usd") or 0
+    targets = td.get("targets") or []
+    initial_sl = td.get("stop_loss")
+    idx = int(td.get("current_target_idx") or 0)
+    if entry is None or entry <= 0 or leverage <= 0 or position <= 0 or not targets:
+        return None, 0.0, 0.0
+
+    is_long = direction == "long"
+    num = len(targets)
+    slice_qty = position / num
+
+    def slice_pnl(close_price: float, qty: float) -> float:
+        pc = (close_price - entry) / entry
+        if not is_long:
+            pc = -pc
+        return pc * qty * leverage
+
+    pnl = 0.0
+    closed_qty = 0.0
+    close_price: float | None = None
+
+    # Partial closes at each hit target
+    for i in range(min(idx, num)):
+        p = targets[i]
+        if p is None:
+            continue
+        pnl += slice_pnl(p, slice_qty)
+        closed_qty += slice_qty
+        close_price = p  # running final fill price
+
+    if idx >= num:
+        # Fully closed via target ladder
+        return close_price, round(pnl, 4), round(closed_qty, 4)
+
+    remainder = max(0.0, position - closed_qty)
+    if remainder <= 0:
+        return close_price, round(pnl, 4), round(closed_qty, 4)
+
+    # Remainder closed by SL/reconcile. Estimate fill price from bot's SL rule.
+    if idx == 0:
+        est_sl = initial_sl
+    elif idx == 1:
+        est_sl = entry  # break-even
+    else:
+        est_sl = targets[idx - 2] if idx - 2 < num else initial_sl
+    if est_sl is None:
+        est_sl = initial_sl
+    if est_sl is None:
+        return close_price, round(pnl, 4), round(closed_qty, 4)
+
+    pnl += slice_pnl(est_sl, remainder)
+    closed_qty += remainder
+    close_price = est_sl
+    return close_price, round(pnl, 4), round(closed_qty, 4)
+
+
 def _sl_progression(td: dict) -> dict:
     """Derive current effective SL + history from current_target_idx."""
     idx = int(td.get("current_target_idx") or 0)
@@ -246,14 +315,16 @@ async def dashboard_data():
     except Exception:
         stats["telegram"] = {"connected": False, "error": "import failed"}
 
-    # Recent Telegram messages (collapse edits under their original message_id)
+    # Recent Telegram messages (collapse edits under their original message_id).
+    # block_reason reflects the LATEST version (edits can resolve initial parse failures).
     tg_messages = []
     try:
         async with get_db_session() as session:
             repo = TradeRepository(session)
             msgs = await repo.get_telegram_messages(limit=80)
-            # Group by message_id — original + edits in one entry
             by_id: dict[int, dict[str, Any]] = {}
+            # Track which row's block_reason to surface — the newest one
+            latest_ts_per_id: dict[int, str] = {}
             for m in msgs:
                 item = by_id.setdefault(m.message_id, {
                     "message_id": m.message_id,
@@ -266,12 +337,14 @@ async def dashboard_data():
                 })
                 ts = m.received_at.isoformat() if m.received_at else None
                 if m.is_edit:
-                    item["edits"].append({"text": (m.text or "")[:500], "at": ts})
+                    item["edits"].append({"text": (m.text or "")[:500], "at": ts, "is_signal": m.is_signal, "block_reason": m.block_reason})
                 else:
                     item["text"] = (m.text or "")[:500]
                     item["received_at"] = ts
                 item["is_signal"] = item["is_signal"] or m.is_signal
-                if m.block_reason:
+                # Only set block_reason from the NEWEST row (latest edit or original)
+                if ts and (latest_ts_per_id.get(m.message_id) is None or ts > latest_ts_per_id[m.message_id]):
+                    latest_ts_per_id[m.message_id] = ts
                     item["block_reason"] = m.block_reason
                 if ts and (item["last_at"] is None or ts > item["last_at"]):
                     item["last_at"] = ts
@@ -281,6 +354,43 @@ async def dashboard_data():
 
     stats["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return {"trades": trades_list, "stats": stats, "messages": tg_messages, "untracked": untracked}
+
+
+@router.post("/dashboard/backfill-pnl", response_class=JSONResponse)
+async def dashboard_backfill_pnl():
+    """One-shot: estimate realized_pnl_usd + close_price for CLOSED trades that have
+    no PnL recorded (pre-existing rows from before PnL tracking shipped).
+    Idempotent: only touches rows where realized_pnl_usd IS NULL."""
+    from ..database.repository import get_db_session, TradeRepository
+    updated = []
+    skipped = []
+    try:
+        async with get_db_session() as session:
+            repo = TradeRepository(session)
+            trades = await repo.get_recent_trades(limit=500)
+            for t in trades:
+                if t.status.value != "closed":
+                    continue
+                if t.realized_pnl_usd is not None:
+                    skipped.append({"id": t.id, "reason": "already_set"})
+                    continue
+                td = t.to_dict()
+                close_price, pnl, qty = _estimate_close_for_closed_trade(td)
+                if close_price is None:
+                    skipped.append({"id": t.id, "reason": "insufficient_data"})
+                    continue
+                await repo.update_trade_field(t.id, "realized_pnl_usd", pnl)
+                await repo.update_trade_field(t.id, "close_price", close_price)
+                await repo.update_trade_field(t.id, "closed_qty_usd", qty)
+                updated.append({
+                    "id": t.id[:8], "symbol": t.symbol, "direction": t.direction.value,
+                    "targets_hit": t.current_target_idx or 0,
+                    "close_price": close_price, "realized_pnl_usd": pnl, "closed_qty_usd": qty,
+                })
+    except Exception as e:
+        return {"error": str(e), "updated": updated, "skipped": skipped}
+    return {"updated_count": len(updated), "skipped_count": len(skipped),
+            "updated": updated, "skipped": skipped}
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
