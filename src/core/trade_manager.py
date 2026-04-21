@@ -541,11 +541,16 @@ class TradeManager:
                 # an approximation using the current market at detection time.
                 close_price = None
                 try:
-                    from ..avantis.pairs import get_price_symbol
-                    price_sym = get_price_symbol(at.symbol) if hasattr(at, "symbol") else at.symbol.upper()
+                    # Trade.symbol is already the price-feed ticker ("BTCUSDT" from the
+                    # signal parser). get_price_symbol takes a pair_index (int) — pass
+                    # that if available, otherwise fall back to the symbol string.
+                    if at.pair_index is not None:
+                        price_sym = get_price_symbol(at.pair_index)
+                    else:
+                        price_sym = at.symbol.upper()
                     close_price = await get_price(price_sym)
                 except Exception as e:
-                    logger.debug("Reconcile: price fetch failed for %s: %s", at.symbol, e)
+                    logger.warning("Reconcile: price fetch failed for %s (%s): %s", at.symbol, at.pair_index, e)
 
                 if close_price is not None and at.remaining_collateral > 0:
                     pnl_slice = _compute_realized_pnl(at, close_price, at.remaining_collateral)
