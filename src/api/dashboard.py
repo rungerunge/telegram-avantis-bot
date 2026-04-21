@@ -373,6 +373,69 @@ async def dashboard_data():
     return {"trades": trades_list, "stats": stats, "messages": tg_messages, "untracked": untracked}
 
 
+@router.post("/dashboard/override-pnl", response_class=JSONResponse)
+async def dashboard_override_pnl(payload: dict):
+    """Force-overwrite realized PnL / close price on a specific closed trade.
+    Intended for reconciling DB estimates against the Lighter account reality
+    when the reconcile path missed a slice (e.g. historical pre-fix rows).
+
+    Body:
+      {
+        "trade_id": "3d6b5927..." (or first 8 chars),
+        "realized_pnl_usd": 102.90,
+        "close_price": 76237.0,        # optional
+        "closed_qty_usd": 1000.0,      # optional
+        "reason": "manual reconcile"   # optional — appended to notes
+      }
+    """
+    from ..database.repository import get_db_session, TradeRepository
+    tid = (payload.get("trade_id") or "").strip()
+    if not tid:
+        return {"error": "trade_id is required"}
+    pnl = payload.get("realized_pnl_usd")
+    if pnl is None:
+        return {"error": "realized_pnl_usd is required"}
+    close_price = payload.get("close_price")
+    closed_qty = payload.get("closed_qty_usd")
+    reason = (payload.get("reason") or "").strip()
+
+    async with get_db_session() as session:
+        repo = TradeRepository(session)
+        # Allow short-ID lookup
+        trades = await repo.get_recent_trades(limit=500)
+        match = None
+        for t in trades:
+            if t.id == tid or t.id.startswith(tid):
+                match = t
+                break
+        if match is None:
+            return {"error": f"trade not found: {tid}"}
+
+        before = {
+            "realized_pnl_usd": match.realized_pnl_usd,
+            "close_price": match.close_price,
+            "closed_qty_usd": match.closed_qty_usd,
+        }
+        await repo.update_trade_field(match.id, "realized_pnl_usd", round(float(pnl), 4))
+        if close_price is not None:
+            await repo.update_trade_field(match.id, "close_price", float(close_price))
+        if closed_qty is not None:
+            await repo.update_trade_field(match.id, "closed_qty_usd", round(float(closed_qty), 4))
+        if reason:
+            new_notes = ((match.notes or "") + f" [override: {reason}]").strip()
+            await repo.update_trade_field(match.id, "notes", new_notes)
+
+    return {
+        "trade_id": match.id, "symbol": match.symbol,
+        "before": before,
+        "after": {
+            "realized_pnl_usd": round(float(pnl), 4),
+            "close_price": float(close_price) if close_price is not None else match.close_price,
+            "closed_qty_usd": round(float(closed_qty), 4) if closed_qty is not None else match.closed_qty_usd,
+        },
+    }
+
+
 @router.post("/dashboard/backfill-pnl", response_class=JSONResponse)
 async def dashboard_backfill_pnl():
     """One-shot: estimate realized_pnl_usd + close_price for CLOSED trades that have
