@@ -6,6 +6,7 @@ Uses the lighter-sdk Python package (pip install git+https://github.com/elliotte
 for order signing via native signer, and the REST API for account/position queries.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -83,6 +84,12 @@ class LighterClient:
         self._api_client = ApiClient(self._config)
         self._account_api = AccountApi(self._api_client)
         self._order_api = OrderApi(self._api_client)
+
+        # Serialize signer write-calls (create/cancel orders) across concurrent
+        # trade flows. Without this, two trades fired from a multi-signal message
+        # can race on the Lighter nonce and one fails with code=21104 'invalid
+        # nonce' (observed on Slavi during #11382 multi-signal 04-22).
+        self._signer_lock = asyncio.Lock()
 
         self._signer.check_client()
         logger.info(
@@ -212,14 +219,15 @@ class LighterClient:
             position_size_usd, base_amount, open_price, sl_price,
         )
 
-        # Place the market order
-        tx, resp, err = await self._signer.create_market_order(
-            market_index=mkt["market_id"],
-            client_order_index=trade_index,
-            base_amount=base_amount,
-            avg_execution_price=avg_execution_price,
-            is_ask=is_ask,
-        )
+        # Place the market order (serialized against other signer calls)
+        async with self._signer_lock:
+            tx, resp, err = await self._signer.create_market_order(
+                market_index=mkt["market_id"],
+                client_order_index=trade_index,
+                base_amount=base_amount,
+                avg_execution_price=avg_execution_price,
+                is_ask=is_ask,
+            )
         if err is not None:
             raise RuntimeError(f"Lighter market order failed: {err}")
 
@@ -261,15 +269,16 @@ class LighterClient:
             is_ask = False  # buying to close short
 
         try:
-            tx, resp, err = await self._signer.create_sl_limit_order(
-                market_index=mkt["market_id"],
-                client_order_index=0,
-                base_amount=base_amount,  # 0 = position-tied
-                trigger_price=trigger_price,
-                price=limit_price,
-                is_ask=is_ask,
-                reduce_only=True,
-            )
+            async with self._signer_lock:
+                tx, resp, err = await self._signer.create_sl_limit_order(
+                    market_index=mkt["market_id"],
+                    client_order_index=0,
+                    base_amount=base_amount,  # 0 = position-tied
+                    trigger_price=trigger_price,
+                    price=limit_price,
+                    is_ask=is_ask,
+                    reduce_only=True,
+                )
             if err is not None:
                 logger.error("Failed to place SL order: %s", err)
                 return None
@@ -350,14 +359,15 @@ class LighterClient:
         else:
             logger.info("Full close %s: %d base units", mkt["symbol"], close_amount)
 
-        tx, resp, err = await self._signer.create_market_order(
-            market_index=mkt["market_id"],
-            client_order_index=0,
-            base_amount=close_amount,
-            avg_execution_price=worst,
-            is_ask=is_ask,
-            reduce_only=True,
-        )
+        async with self._signer_lock:
+            tx, resp, err = await self._signer.create_market_order(
+                market_index=mkt["market_id"],
+                client_order_index=0,
+                base_amount=close_amount,
+                avg_execution_price=worst,
+                is_ask=is_ask,
+                reduce_only=True,
+            )
         if err is not None:
             raise RuntimeError(f"Lighter close order failed: {err}")
 
@@ -410,10 +420,11 @@ class LighterClient:
                 # SL types: 2 (stop_loss), 3 (stop_loss_limit)
                 if order_type in (2, 3):
                     try:
-                        _, _, err = await self._signer.cancel_order(
-                            market_index=mkt["market_id"],
-                            order_index=int(order.order_index),
-                        )
+                        async with self._signer_lock:
+                            _, _, err = await self._signer.cancel_order(
+                                market_index=mkt["market_id"],
+                                order_index=int(order.order_index),
+                            )
                         if err:
                             logger.warning("Failed to cancel SL order %s: %s", order.order_index, err)
                         else:
